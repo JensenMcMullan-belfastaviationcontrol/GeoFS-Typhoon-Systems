@@ -1,0 +1,1103 @@
+// ==UserScript==
+// @name         GeoFS Eurofighter Typhoon Systems
+// @namespace    https://geo-fs.com/
+// @version      1.0.0
+// @description  Typhoon-inspired gear safety, reverse/afterburner protection, canopy, radar and autopilot helpers for GeoFS.
+// @author       Jensen
+// @match        https://www.geo-fs.com/*
+// @match        https://geo-fs.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /*
+     * ============================================================
+     * EUROFIGHTER TYPHOON SYSTEMS
+     * ============================================================
+     *
+     * Adapted from the FlightGear NAS/XML systems you supplied.
+     *
+     * IMPORTANT:
+     * FlightGear properties such as getprop(), setprop(),
+     * PID controllers and XML PropertyLists do not exist directly
+     * in GeoFS, so this is a GeoFS JavaScript adaptation.
+     */
+
+    let aircraftReady = false;
+
+    const waitForGeoFS = setInterval(function () {
+
+        if (
+            window.geofs &&
+            window.geofs.aircraft &&
+            window.geofs.aircraft.instance &&
+            window.controls
+        ) {
+            clearInterval(waitForGeoFS);
+            initTyphoon();
+        }
+
+    }, 500);
+
+
+    function initTyphoon() {
+
+        if (window.__TYPHOON_SYSTEMS_LOADED__) {
+            return;
+        }
+
+        window.__TYPHOON_SYSTEMS_LOADED__ = true;
+        aircraftReady = true;
+
+
+        // ========================================================
+        // STATE
+        // ========================================================
+
+        const state = {
+
+            autopilot: false,
+
+            targetHeading: 0,
+            targetAltitude: 4000,
+
+            targetSpeed: 350,
+            targetMach: 1.2,
+
+            speedMode: 'kts',
+
+            allowReheat: false,
+
+            radarStandby: false,
+            radarLock: false,
+            lockedTarget: null,
+
+            canopyOpen: false,
+            tailhookDown: false,
+
+            gearDown: true
+
+        };
+
+
+        // ========================================================
+        // HELPERS
+        // ========================================================
+
+        function aircraft() {
+            return window.geofs.aircraft.instance;
+        }
+
+
+        function clamp(value, min, max) {
+
+            return Math.max(
+                min,
+                Math.min(max, value)
+            );
+
+        }
+
+
+        function normalizeHeading(angle) {
+
+            return ((angle + 540) % 360) - 180;
+
+        }
+
+
+        function getHeading() {
+
+            const a = aircraft();
+
+            return Number(
+                a.heading ||
+                a.heading360 ||
+                0
+            );
+
+        }
+
+
+        function getAltitude() {
+
+            const a = aircraft();
+
+            return Number(
+                a.altitude ||
+                a.position?.altitude ||
+                0
+            );
+
+        }
+
+
+        function getSpeed() {
+
+            const a = aircraft();
+
+            return Number(
+                a.airSpeed ||
+                window.geofs.animation?.values?.kias ||
+                0
+            );
+
+        }
+
+
+        function getMach() {
+
+            const a = aircraft();
+
+            return Number(
+                a.mach ||
+                window.geofs.animation?.values?.mach ||
+                0
+            );
+
+        }
+
+
+        function getPitch() {
+
+            const a = aircraft();
+
+            return Number(
+                a.pitch ||
+                window.geofs.animation?.values?.pitch ||
+                0
+            );
+
+        }
+
+
+        function getRoll() {
+
+            const a = aircraft();
+
+            return Number(
+                a.roll ||
+                window.geofs.animation?.values?.roll ||
+                0
+            );
+
+        }
+
+
+        // ========================================================
+        // GROUND / WOW
+        // ========================================================
+
+        function weightOnWheels() {
+
+            const a = aircraft();
+
+            return !!(
+                a.groundContact ||
+                a.onGround
+            );
+
+        }
+
+
+        // ========================================================
+        // GEAR SAFETY
+        // ========================================================
+
+        function gearSafety() {
+
+            if (!aircraftReady) {
+                return;
+            }
+
+            /*
+             * The original Typhoon code prevents gear retraction
+             * while WOW is active.
+             */
+
+            if (weightOnWheels()) {
+
+                state.gearDown = true;
+
+            }
+
+        }
+
+
+        // ========================================================
+        // AFTERBURNER / REVERSE PROTECTION
+        // ========================================================
+
+        function engineProtection() {
+
+            if (!window.controls) {
+                return;
+            }
+
+            let throttle = 0;
+
+            if (Array.isArray(controls.throttle)) {
+
+                throttle = Math.max(
+                    ...controls.throttle.map(Number)
+                );
+
+            } else {
+
+                throttle = Number(
+                    controls.throttle || 0
+                );
+
+            }
+
+
+            /*
+             * Original Typhoon logic:
+             *
+             * Reverse + throttle > 30%
+             * = throttle limited to 30%.
+             */
+
+            if (controls.reverse && throttle > 0.30) {
+
+                throttle = 0.30;
+
+                if (Array.isArray(controls.throttle)) {
+
+                    controls.throttle[0] = 0.30;
+
+                    if (controls.throttle.length > 1) {
+                        controls.throttle[1] = 0.30;
+                    }
+
+                } else {
+
+                    controls.throttle = 0.30;
+
+                }
+
+            }
+
+
+            /*
+             * Without reheat permission, prevent maximum throttle.
+             */
+
+            if (!state.allowReheat) {
+
+                throttle = Math.min(
+                    throttle,
+                    0.94
+                );
+
+            }
+
+        }
+
+
+        // ========================================================
+        // AUTOPILOT
+        // ========================================================
+
+        function autopilotUpdate() {
+
+            if (!state.autopilot) {
+                return;
+            }
+
+
+            const heading = getHeading();
+            const altitude = getAltitude();
+            const pitch = getPitch();
+            const roll = getRoll();
+
+
+            // ----------------------------------------------------
+            // HEADING HOLD
+            // ----------------------------------------------------
+
+            const headingError =
+                normalizeHeading(
+                    state.targetHeading - heading
+                );
+
+
+            const targetRoll =
+                clamp(
+                    headingError * 0.35,
+                    -40,
+                    40
+                );
+
+
+            const rollError =
+                targetRoll - roll;
+
+
+            controls.roll =
+                clamp(
+                    rollError * 0.025,
+                    -1,
+                    1
+                );
+
+
+            // ----------------------------------------------------
+            // ALTITUDE HOLD
+            // ----------------------------------------------------
+
+            const altitudeError =
+                state.targetAltitude - altitude;
+
+
+            const targetPitch =
+                clamp(
+                    altitudeError * 0.0035,
+                    -12,
+                    12
+                );
+
+
+            const pitchError =
+                targetPitch - pitch;
+
+
+            controls.pitch =
+                clamp(
+                    pitchError * 0.12,
+                    -1,
+                    1
+                );
+
+
+            // ----------------------------------------------------
+            // SPEED HOLD
+            // ----------------------------------------------------
+
+            let throttle;
+
+            if (state.speedMode === 'mach') {
+
+                const currentMach =
+                    getMach();
+
+                const error =
+                    state.targetMach - currentMach;
+
+                throttle =
+                    0.55 +
+                    error * 1.4;
+
+            } else {
+
+                const currentSpeed =
+                    getSpeed();
+
+                const error =
+                    state.targetSpeed - currentSpeed;
+
+                throttle =
+                    0.55 +
+                    error * 0.008;
+
+            }
+
+
+            const maximum =
+                state.allowReheat
+                    ? 1.0
+                    : 0.94;
+
+
+            throttle =
+                clamp(
+                    throttle,
+                    0,
+                    maximum
+                );
+
+
+            // ----------------------------------------------------
+            // TWO ENGINE THROTTLE
+            // ----------------------------------------------------
+
+            if (Array.isArray(controls.throttle)) {
+
+                controls.throttle[0] =
+                    throttle;
+
+                if (controls.throttle.length > 1) {
+
+                    controls.throttle[1] =
+                        throttle;
+
+                }
+
+            } else {
+
+                controls.throttle =
+                    throttle;
+
+            }
+
+        }
+
+
+        // ========================================================
+        // RADAR / BORESIGHT
+        // ========================================================
+
+        function findBoresightTarget() {
+
+            if (state.radarStandby) {
+                return null;
+            }
+
+
+            if (
+                !window.ai ||
+                !window.ai.models
+            ) {
+                return null;
+            }
+
+
+            const candidates = [];
+
+
+            if (
+                Array.isArray(
+                    window.ai.models.aircraft
+                )
+            ) {
+
+                candidates.push(
+                    ...window.ai.models.aircraft
+                );
+
+            }
+
+
+            if (
+                Array.isArray(
+                    window.ai.models.multiplayer
+                )
+            ) {
+
+                candidates.push(
+                    ...window.ai.models.multiplayer
+                );
+
+            }
+
+
+            let bestTarget = null;
+            let bestScore = Infinity;
+
+
+            for (const target of candidates) {
+
+                if (!target) {
+                    continue;
+                }
+
+
+                const radar =
+                    target.radar || {};
+
+
+                const horizontal =
+                    Number(
+                        radar.hOffset ??
+                        target.hOffset ??
+                        999
+                    );
+
+
+                const vertical =
+                    Number(
+                        radar.vOffset ??
+                        target.vOffset ??
+                        999
+                    );
+
+
+                const inRange =
+                    radar.inRange ??
+                    true;
+
+
+                /*
+                 * Original boresight cone was approximately
+                 * +/-3 degrees horizontally and vertically.
+                 */
+
+                if (!inRange) {
+                    continue;
+                }
+
+
+                if (
+                    Math.abs(horizontal) >= 3 ||
+                    Math.abs(vertical) >= 3
+                ) {
+                    continue;
+                }
+
+
+                const score =
+                    Math.abs(horizontal) +
+                    Math.abs(vertical);
+
+
+                if (score < bestScore) {
+
+                    bestScore = score;
+                    bestTarget = target;
+
+                }
+
+            }
+
+
+            return bestTarget;
+
+        }
+
+
+        function radarUpdate() {
+
+            if (state.radarStandby) {
+
+                state.radarLock = false;
+                state.lockedTarget = null;
+
+                return;
+
+            }
+
+
+            const target =
+                findBoresightTarget();
+
+
+            if (!target) {
+
+                state.radarLock = false;
+                state.lockedTarget = null;
+
+                return;
+
+            }
+
+
+            /*
+             * Require the target to remain in the
+             * boresight for multiple update cycles.
+             */
+
+            if (
+                state.lockedTarget === target
+            ) {
+
+                state.radarLock = true;
+
+            } else {
+
+                state.lockedTarget =
+                    target;
+
+                state.radarLock = false;
+
+            }
+
+        }
+
+
+        // ========================================================
+        // CANOPY
+        // ========================================================
+
+        function setCanopy(open) {
+
+            state.canopyOpen =
+                !!open;
+
+
+            if (
+                window.geofs.animation &&
+                window.geofs.animation.values
+            ) {
+
+                window.geofs.animation.values.canopy =
+                    state.canopyOpen
+                        ? 1
+                        : 0;
+
+            }
+
+        }
+
+
+        // ========================================================
+        // TAILHOOK
+        // ========================================================
+
+        function setTailhook(down) {
+
+            state.tailhookDown =
+                !!down;
+
+
+            if (
+                window.geofs.animation &&
+                window.geofs.animation.values
+            ) {
+
+                window.geofs.animation.values.tailhook =
+                    state.tailhookDown
+                        ? 1
+                        : 0;
+
+            }
+
+        }
+
+
+        // ========================================================
+        // NOTIFICATION
+        // ========================================================
+
+        function notify(message) {
+
+            console.log(
+                '[Typhoon]',
+                message
+            );
+
+
+            const old =
+                document.getElementById(
+                    'typhoon-notification'
+                );
+
+
+            if (old) {
+                old.remove();
+            }
+
+
+            const box =
+                document.createElement(
+                    'div'
+                );
+
+
+            box.id =
+                'typhoon-notification';
+
+
+            box.textContent =
+                message;
+
+
+            Object.assign(
+                box.style,
+                {
+
+                    position: 'fixed',
+
+                    left: '50%',
+
+                    top: '15%',
+
+                    transform:
+                        'translate(-50%, -50%)',
+
+                    padding:
+                        '8px 16px',
+
+                    background:
+                        'rgba(0,0,0,0.75)',
+
+                    color:
+                        'white',
+
+                    font:
+                        'bold 14px Arial',
+
+                    borderRadius:
+                        '5px',
+
+                    zIndex:
+                        '999999',
+
+                    pointerEvents:
+                        'none'
+
+                }
+            );
+
+
+            document.body.appendChild(
+                box
+            );
+
+
+            setTimeout(
+                () => box.remove(),
+                1500
+            );
+
+        }
+
+
+        // ========================================================
+        // KEYBOARD CONTROLS
+        // ========================================================
+
+        document.addEventListener(
+            'keydown',
+            function (event) {
+
+                if (event.repeat) {
+                    return;
+                }
+
+
+                if (
+                    event.target &&
+                    /INPUT|TEXTAREA|SELECT/.test(
+                        event.target.tagName
+                    )
+                ) {
+                    return;
+                }
+
+
+                // SHIFT + A
+                if (
+                    event.shiftKey &&
+                    event.key.toLowerCase() === 'a'
+                ) {
+
+                    state.autopilot =
+                        !state.autopilot;
+
+
+                    if (
+                        state.autopilot
+                    ) {
+
+                        state.targetHeading =
+                            getHeading();
+
+                        state.targetAltitude =
+                            getAltitude();
+
+                    }
+
+
+                    notify(
+                        'Typhoon AP ' +
+                        (
+                            state.autopilot
+                                ? 'ENGAGED'
+                                : 'DISENGAGED'
+                        )
+                    );
+
+
+                    event.preventDefault();
+
+                }
+
+
+                // SHIFT + R
+                if (
+                    event.shiftKey &&
+                    event.key.toLowerCase() === 'r'
+                ) {
+
+                    state.radarStandby =
+                        !state.radarStandby;
+
+
+                    notify(
+                        'Radar ' +
+                        (
+                            state.radarStandby
+                                ? 'STANDBY'
+                                : 'ACTIVE'
+                        )
+                    );
+
+
+                    event.preventDefault();
+
+                }
+
+
+                // SHIFT + C
+                if (
+                    event.shiftKey &&
+                    event.key.toLowerCase() === 'c'
+                ) {
+
+                    setCanopy(
+                        !state.canopyOpen
+                    );
+
+
+                    notify(
+                        'Canopy ' +
+                        (
+                            state.canopyOpen
+                                ? 'OPEN'
+                                : 'CLOSED'
+                        )
+                    );
+
+
+                    event.preventDefault();
+
+                }
+
+
+                // SHIFT + H
+                if (
+                    event.shiftKey &&
+                    event.key.toLowerCase() === 'h'
+                ) {
+
+                    setTailhook(
+                        !state.tailhookDown
+                    );
+
+
+                    notify(
+                        'Tailhook ' +
+                        (
+                            state.tailhookDown
+                                ? 'DOWN'
+                                : 'UP'
+                        )
+                    );
+
+
+                    event.preventDefault();
+
+                }
+
+
+                // SHIFT + M
+                if (
+                    event.shiftKey &&
+                    event.key.toLowerCase() === 'm'
+                ) {
+
+                    state.speedMode =
+                        state.speedMode === 'kts'
+                            ? 'mach'
+                            : 'kts';
+
+
+                    notify(
+                        'AP speed mode: ' +
+                        state.speedMode.toUpperCase()
+                    );
+
+
+                    event.preventDefault();
+
+                }
+
+            },
+            true
+        );
+
+
+        // ========================================================
+        // PUBLIC API
+        // ========================================================
+
+        window.typhoonSystems = {
+
+            state: state,
+
+
+            engageAP() {
+
+                state.autopilot =
+                    true;
+
+                state.targetHeading =
+                    getHeading();
+
+                state.targetAltitude =
+                    getAltitude();
+
+            },
+
+
+            disengageAP() {
+
+                state.autopilot =
+                    false;
+
+            },
+
+
+            setHeading(heading) {
+
+                state.targetHeading =
+                    (
+                        Number(heading) % 360 +
+                        360
+                    ) % 360;
+
+            },
+
+
+            setAltitude(feet) {
+
+                state.targetAltitude =
+                    Math.max(
+                        0,
+                        Number(feet)
+                    );
+
+            },
+
+
+            setSpeed(knots) {
+
+                state.speedMode =
+                    'kts';
+
+                state.targetSpeed =
+                    Math.max(
+                        0,
+                        Number(knots)
+                    );
+
+            },
+
+
+            setMach(mach) {
+
+                state.speedMode =
+                    'mach';
+
+                state.targetMach =
+                    Math.max(
+                        0,
+                        Number(mach)
+                    );
+
+            },
+
+
+            allowReheat(enabled) {
+
+                state.allowReheat =
+                    !!enabled;
+
+            },
+
+
+            radarStandby(enabled) {
+
+                state.radarStandby =
+                    !!enabled;
+
+            },
+
+
+            getRadarLock() {
+
+                return state.radarLock
+                    ? state.lockedTarget
+                    : null;
+
+            },
+
+
+            openCanopy() {
+
+                setCanopy(true);
+
+            },
+
+
+            closeCanopy() {
+
+                setCanopy(false);
+
+            },
+
+
+            tailhookDown() {
+
+                setTailhook(true);
+
+            },
+
+
+            tailhookUp() {
+
+                setTailhook(false);
+
+            }
+
+        };
+
+
+        // ========================================================
+        // MAIN LOOP
+        // ========================================================
+
+        setInterval(
+            function () {
+
+                gearSafety();
+
+                engineProtection();
+
+                autopilotUpdate();
+
+                radarUpdate();
+
+            },
+            50
+        );
+
+
+        // ========================================================
+        // READY
+        // ========================================================
+
+        console.log(
+            '%c[Eurofighter Typhoon Systems] LOADED',
+            'font-weight:bold;color:#66ccff;font-size:14px'
+        );
+
+
+        console.log(
+            'Shift+A = AP | ' +
+            'Shift+R = Radar | ' +
+            'Shift+C = Canopy | ' +
+            'Shift+H = Tailhook | ' +
+            'Shift+M = KTS/Mach'
+        );
+
+
+        notify(
+            'EUROFIGHTER TYPHOON SYSTEMS LOADED'
+        );
+
+    }
+
+})();
